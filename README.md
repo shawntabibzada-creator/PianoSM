@@ -57,9 +57,29 @@ Getting this wrong was the single biggest source of misdetection in the
 original prototype: it silently assumed every video was exactly 1080p.
 
 Hue calibration (which color is "left hand" vs "right hand") scans
-forward from the start of the video accumulating a histogram of bright
+forward from the start of the video accumulating a histogram of bar
 pixels until it has enough samples, rather than assuming the first note
-always lands in a fixed 2.8s-6.5s window.
+always lands in a fixed 2.8s-6.5s window. Two more things are adapted
+from this same scan, per-video, rather than trusting fixed numbers tuned
+on one reference recording:
+
+- **Bright/pastel split.** The saturation/value threshold for "this is
+  the played color, not the falling color" is found via Otsu's method on
+  this video's own bar-colored pixels. A fixed threshold (175/100) meant
+  a video whose "played" color is less saturated than that reference
+  would systematically miss real notes — nothing ever crossed the bar —
+  while whatever unrelated element *did* happen to be that saturated
+  (a watermark, a UI accent) could dominate calibration instead.
+- **Hue tolerance.** If the two calibrated hand colors turn out to be
+  close together on the hue wheel, the tolerance used to decide "is this
+  pixel hand A's color" is shrunk so the two hands' color zones can't
+  overlap. Two colors closer than ~2x the default tolerance previously
+  meant a pixel near the midpoint could match as either hand, or the
+  general bar mask couldn't cleanly tell them apart at all.
+
+Both are logged (`Adapted bright/pastel split from this video's own
+colors...` / `Calibrated hues are only N degrees apart; shrinking hue
+tolerance...`) so you can see when they kicked in.
 
 Output `tracked_notes.json` has the shape:
 
@@ -81,6 +101,13 @@ gave the original prototype fragile, easily-wrong tempo estimates.
 Notes that would cross a measure barline are split into tied fragments
 instead of being truncated with the remainder dropped, and both hands
 always share the same measure count so the grand staff stays aligned.
+
+Notes far above the treble staff (>= C6 by default) or below the bass
+staff (<= C2) are wrapped in an 8va/8vb bracket and notated an octave
+closer to the staff, instead of printing a wall of ledger lines. This
+only affects the MusicXML — the MIDI file always plays back the true
+detected pitch (written from the score *before* the octave-bracket
+transposition is applied to a copy used only for the MusicXML export).
 
 ## Testing
 

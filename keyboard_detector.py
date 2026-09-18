@@ -133,6 +133,29 @@ def hue_distance(h: np.ndarray, target: float) -> np.ndarray:
     return np.minimum(d, 180.0 - d)
 
 
+def clamp_hue_tolerance_for_separation(cfg: DetectorConfig, left_hue: float, right_hue: float, logger) -> None:
+    """If the two hand colors happen to be close together on the hue
+    wheel, the default tolerances can make their "is this pixel this
+    hand's color" zones overlap, so a pixel near the midpoint gets
+    matched as both hands (or neither cleanly). Shrink the tolerances in
+    place so the two zones never touch, whatever the calibrated hues
+    turn out to be.
+    """
+
+    gap = min(abs(left_hue - right_hue), 180.0 - abs(left_hue - right_hue))
+    safety_margin = 2.0
+    max_safe = max(3.0, gap / 2.0 - safety_margin)
+
+    if cfg.hue_tolerance > max_safe or cfg.general_hue_tolerance > max_safe:
+        logger.warning(
+            f"Calibrated hues are only {gap:.1f} degrees apart; shrinking hue tolerance "
+            f"{cfg.hue_tolerance:.1f}/{cfg.general_hue_tolerance:.1f} -> {max_safe:.1f} "
+            "so one hand's color can't be matched as the other's."
+        )
+        cfg.hue_tolerance = min(cfg.hue_tolerance, max_safe)
+        cfg.general_hue_tolerance = min(cfg.general_hue_tolerance, max_safe)
+
+
 # ============================================================
 # MASKS
 # ============================================================
@@ -162,6 +185,87 @@ def bright_mask(hsv: np.ndarray, hue: float, cfg: DetectorConfig) -> np.ndarray:
 # ============================================================
 
 
+def _adapt_bright_thresholds(
+    video: cv2.VideoCapture,
+    scanned_indices: List[int],
+    keyboard_top: int,
+    color_a: float,
+    color_b: float,
+    cfg: DetectorConfig,
+    logger,
+    min_samples: int = 200,
+) -> None:
+    """min_bright_sat/value (175/100) were tuned against one reference
+    video's "played" color. If a different video's played color is less
+    saturated than that, nothing ever crosses the threshold: real notes
+    go undetected for the whole video, and whatever few things ARE
+    saturated enough (a watermark, a UI accent) can end up dominating
+    calibration instead. Look at the actual saturation/value distribution
+    of this video's own bar-colored pixels and split pastel from played
+    with Otsu's method, rather than trusting a fixed number.
+    """
+
+    sat_samples = []
+    val_samples = []
+
+    for fi in scanned_indices:
+        video.set(cv2.CAP_PROP_POS_FRAMES, fi)
+        ok, frame = video.read()
+
+        if not ok:
+            continue
+
+        hsv = cv2.cvtColor(frame[:keyboard_top], cv2.COLOR_BGR2HSV)
+        h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+        bar = (s >= cfg.min_bar_sat) & (v >= cfg.min_bar_value)
+        near_hue = (hue_distance(h, color_a) <= cfg.general_hue_tolerance) | (
+            hue_distance(h, color_b) <= cfg.general_hue_tolerance
+        )
+        mask = bar & near_hue
+
+        if np.any(mask):
+            sat_samples.append(s[mask])
+            val_samples.append(v[mask])
+
+    if not val_samples:
+        logger.debug("No bar-colored samples for bright-threshold adaptation; keeping defaults")
+        return
+
+    all_sat = np.concatenate(sat_samples)
+    all_val = np.concatenate(val_samples)
+
+    if len(all_val) < min_samples or int(all_val.max()) == int(all_val.min()):
+        logger.debug("Too few/uniform bar-colored samples to adapt bright threshold; keeping defaults")
+        return
+
+    val_u8 = all_val.astype(np.uint8).reshape(-1, 1)
+    otsu_val, _ = cv2.threshold(val_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    below = int(np.count_nonzero(all_val < otsu_val))
+    above = len(all_val) - below
+    if below < 0.05 * len(all_val) or above < 0.05 * len(all_val):
+        logger.debug(
+            f"Value channel of bar pixels doesn't look bimodal (Otsu={otsu_val:.0f}, "
+            f"{below}/{above} below/above split); keeping default bright/pastel threshold"
+        )
+        return
+
+    sat_u8 = all_sat.astype(np.uint8).reshape(-1, 1)
+    otsu_sat, _ = cv2.threshold(sat_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    new_min_value = int(otsu_val) + 5
+    new_min_sat = int(otsu_sat) + 5
+
+    logger.info(
+        f"Adapted bright/pastel split from this video's own colors "
+        f"({len(all_val)} samples): sat {cfg.min_bright_sat}->{new_min_sat}, "
+        f"value {cfg.min_bright_value}->{new_min_value}"
+    )
+    cfg.min_bright_sat = new_min_sat
+    cfg.min_bright_value = new_min_value
+
+
 def learn_bright_hues(
     video: cv2.VideoCapture,
     fps: float,
@@ -170,7 +274,7 @@ def learn_bright_hues(
     cfg: DetectorConfig,
     logger,
     max_scan_seconds: float = 30.0,
-    target_bright_px: int = 4000,
+    target_bar_px: int = 4000,
     min_frames_scanned: int = 6,
 ) -> Tuple[float, float, dict]:
     """Scan forward from the start of the video, accumulating a hue
@@ -188,7 +292,7 @@ def learn_bright_hues(
     max_frame = min(frame_count - 1, int(round(max_scan_seconds * fps)))
 
     scanned_indices: List[int] = []
-    total_bright_px = 0
+    total_bar_px = 0
 
     fi = 0
     while fi <= max_frame:
@@ -201,23 +305,31 @@ def learn_bright_hues(
         hsv = cv2.cvtColor(frame[:keyboard_top], cv2.COLOR_BGR2HSV)
         h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
 
-        bright = (s >= cfg.min_bright_sat) & (v >= cfg.min_bright_value)
-        n = int(np.count_nonzero(bright))
+        # Use the loose "any bar pixel" mask here, not the strict bright
+        # threshold: which saturation/value actually means "played" is
+        # itself something this function figures out below, from this
+        # same video. Gating the hue histogram on a hardcoded bright
+        # threshold first is circular — if this video's played color
+        # never reaches that fixed threshold, the histogram comes back
+        # empty (or dominated by an unrelated saturated element, like a
+        # watermark) before we ever get a chance to learn the real one.
+        bar = (s >= cfg.min_bar_sat) & (v >= cfg.min_bar_value)
+        n = int(np.count_nonzero(bar))
 
         if n:
-            hist += np.bincount(h[bright].ravel(), minlength=180)
-            total_bright_px += n
+            hist += np.bincount(h[bar].ravel(), minlength=180)
+            total_bar_px += n
 
         scanned_indices.append(fi)
         fi += step
 
-        if total_bright_px >= target_bright_px and len(scanned_indices) >= min_frames_scanned:
+        if total_bar_px >= target_bar_px and len(scanned_indices) >= min_frames_scanned:
             break
 
     logger.info(
         f"Calibration scanned {len(scanned_indices)} frames "
         f"(up to t={scanned_indices[-1] / fps:.2f}s), "
-        f"collected {total_bright_px} bright pixels"
+        f"collected {total_bar_px} bar-colored pixels"
     )
 
     pad = np.concatenate([hist[-5:], hist, hist[:5]])
@@ -243,6 +355,9 @@ def learn_bright_hues(
         color_a, color_b = FALLBACK_LEFT_HUE, FALLBACK_RIGHT_HUE
         used_fallback = True
         logger.warning("Could not find two distinct hue peaks; using fallback hues")
+
+    clamp_hue_tolerance_for_separation(cfg, color_a, color_b, logger)
+    _adapt_bright_thresholds(video, scanned_indices, keyboard_top, color_a, color_b, cfg, logger)
 
     # Determine left/right by x location, reusing the same scanned frames
     # (not a separate re-scan of an arbitrary fixed window).
@@ -292,7 +407,7 @@ def learn_bright_hues(
         "right_hue": right_hue,
         "used_fallback": used_fallback,
         "frames_scanned": len(scanned_indices),
-        "bright_pixels_seen": total_bright_px,
+        "bar_pixels_seen": total_bar_px,
     }
 
     return left_hue, right_hue, info
@@ -895,6 +1010,7 @@ def main(argv=None):
         left_hue, right_hue = args.left_hue, args.right_hue
         cal_info = {"left_hue": left_hue, "right_hue": right_hue, "used_fallback": False, "manual_override": True}
         logger.info(f"Using manually specified hues: left={left_hue:.1f} right={right_hue:.1f}")
+        clamp_hue_tolerance_for_separation(cfg, left_hue, right_hue, logger)
     else:
         left_hue, right_hue, cal_info = learn_bright_hues(video, fps, frame_count, keyboard_top, cfg, logger)
         logger.info(f"Calibrated hues: left={left_hue:.1f} right={right_hue:.1f} (fallback={cal_info['used_fallback']})")

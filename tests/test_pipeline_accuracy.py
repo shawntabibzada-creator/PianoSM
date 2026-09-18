@@ -274,3 +274,80 @@ def test_sheet_generation_recovers_tempo_and_ties(detected_notes_json, tmp_path,
     left_part = next(p for p in score.parts if p.id == "LH")
     tied_notes = [n for m in left_part.getElementsByClass("Measure") for n in m.notes if n.tie is not None]
     assert tied_notes, "Expected the sustained left-hand note to be split into tied fragments across the barline"
+
+
+def test_ottava_bracket_transposes_display_pitch_only(logger):
+    """Unit-level check on apply_ottava_brackets: a note above the high
+    threshold gets wrapped in an 8va spanner and its displayed pitch
+    shifts down an octave; a note below the low threshold gets an 8vb
+    spanner and shifts up an octave. Notes inside the normal range are
+    left untouched."""
+
+    from music21 import note as m21note
+    from music21 import spanner as m21spanner
+    from music21 import stream as m21stream
+
+    part = m21stream.Part()
+    part.id = "RH"
+    m = m21stream.Measure(number=1)
+
+    high_note = m21note.Note(midi=96)   # C7 -- above OTTAVA_HIGH_MIDI (84)
+    normal_note = m21note.Note(midi=60)  # C4 -- untouched
+    low_note = m21note.Note(midi=28)    # E1 -- below OTTAVA_LOW_MIDI (36)
+
+    m.insert(0, high_note)
+    m.insert(1, normal_note)
+    m.insert(2, low_note)
+    part.append(m)
+
+    bracket_count = json_to_sheet.apply_ottava_brackets(part, logger)
+
+    assert bracket_count == 2  # one high run, one low run (normal_note breaks them apart)
+    assert high_note.pitch.midi == 96 - 12
+    assert normal_note.pitch.midi == 60
+    assert low_note.pitch.midi == 28 + 12
+
+    ottavas = list(part.getElementsByClass(m21spanner.Ottava))
+    assert len(ottavas) == 2
+    types = sorted(o.type for o in ottavas)
+    assert types == ["8va", "8vb"]
+
+
+def test_convert_keeps_true_pitch_in_midi_but_shifts_musicxml(tmp_path, logger):
+    """End-to-end: a note far above the staff should play back at its real
+    detected pitch in the MIDI file, while the MusicXML shows it inside an
+    8va bracket with the notated pitch shifted down an octave."""
+
+    from music21 import converter as m21converter
+    from music21 import spanner as m21spanner
+
+    notes = [
+        {"pitch": "C4", "midi": 60, "type": "white", "hand": "right", "start_time": 0.0, "end_time": 0.4},
+        {"pitch": "D4", "midi": 62, "type": "white", "hand": "right", "start_time": 0.4, "end_time": 0.8},
+        {"pitch": "C7", "midi": 96, "type": "white", "hand": "right", "start_time": 0.8, "end_time": 1.2},
+        {"pitch": "E4", "midi": 64, "type": "white", "hand": "right", "start_time": 1.2, "end_time": 1.6},
+    ]
+
+    tracked_path = tmp_path / "tracked_notes.json"
+    with open(tracked_path, "w", encoding="utf-8") as f:
+        json.dump({"meta": {"fps": 30.0}, "notes": notes}, f)
+
+    out_musicxml = tmp_path / "ottava.musicxml"
+    out_midi = tmp_path / "ottava.mid"
+
+    json_to_sheet.convert(tracked_path, out_musicxml, out_midi, logger)
+
+    # Part ids ("RH"/"LH") aren't preserved through a MusicXML round-trip
+    # (music21 reassigns its own on reload), so just inspect the whole score.
+    reloaded = m21converter.parse(str(out_musicxml))
+
+    ottavas = list(reloaded.recurse().getElementsByClass(m21spanner.Ottava))
+    assert ottavas, "Expected an ottava bracket around the C7 note in the MusicXML"
+
+    xml_notes = list(reloaded.recurse().notes)
+    shifted = [n for n in xml_notes if n.pitch.midi == 96 - 12]
+    assert shifted, "Expected the C7 note to be notated an octave lower under the 8va bracket"
+
+    midi_score = m21converter.parse(str(out_midi))
+    midi_pitches = {n.pitch.midi for n in midi_score.recurse().notes}
+    assert 96 in midi_pitches, "MIDI playback must keep the true detected pitch, not the notated one"

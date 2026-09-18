@@ -25,15 +25,19 @@ Fixes over the original prototype:
     onset (common when the detector reports a delayed release, e.g. from
     a lingering bright frame) produced overlapping notation. They are now
     clipped to end at the next onset in that hand.
+  * Notes far above the treble staff or below the bass staff were printed
+    with a wall of ledger lines instead of an 8va/8vb bracket, which is
+    both hard to read and not how engraved sheet music is normally done.
 """
 
+import copy
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from music21 import chord, clef, duration, meter, metadata, note, stream, tempo, tie
+from music21 import chord, clef, duration, meter, metadata, note, spanner, stream, tempo, tie
 
 from common import DEFAULT_MIDI, DEFAULT_MUSICXML, DEFAULT_TRACKED_JSON, LOG_DIR, get_logger
 
@@ -46,6 +50,13 @@ FALLBACK_FPS = 30.0
 QUARTER_CANDIDATES = np.arange(0.25, 1.30, 0.005)
 GRID_CANDIDATES_COARSE_TO_FINE = [1.0, 0.5, 1.0 / 3.0, 0.25]
 ONSET_MATCH_TOLERANCE = 0.07
+
+# Above/below these, engraved sheet music normally uses an 8va/8vb
+# bracket instead of a wall of ledger lines. C6 and C2 are conservative
+# defaults (some engravers go a couple of semitones further before
+# switching) — tune per taste.
+OTTAVA_HIGH_MIDI = 84  # C6
+OTTAVA_LOW_MIDI = 36  # C2
 
 
 # ============================================================
@@ -357,6 +368,85 @@ def build_part(hand_data: Dict[float, List[dict]], clef_obj, num_measures: int, 
 
 
 # ============================================================
+# OTTAVA (8va/8vb) BRACKETS
+# ============================================================
+
+
+def _ottava_zone(el, high_threshold: int, low_threshold: int) -> Optional[str]:
+    if isinstance(el, chord.Chord):
+        pitches = el.pitches
+    elif isinstance(el, note.Note):
+        pitches = [el.pitch]
+    else:
+        return None
+
+    if not pitches:
+        return None
+
+    if max(p.midi for p in pitches) >= high_threshold:
+        return "high"
+    if min(p.midi for p in pitches) <= low_threshold:
+        return "low"
+    return None
+
+
+def apply_ottava_brackets(
+    part: stream.Part,
+    logger,
+    high_threshold: int = OTTAVA_HIGH_MIDI,
+    low_threshold: int = OTTAVA_LOW_MIDI,
+) -> int:
+    """Wrap runs of consecutive notes above/below the given thresholds in
+    8va/8vb spanners, transposing the notated pitch by an octave so the
+    bracket and the noteheads agree. Applied to a copy of the score used
+    only for the MusicXML export — the MIDI export must keep the true
+    detected pitches, not the notated ones.
+    """
+
+    elements = sorted(part.recurse().notes, key=lambda n: n.getOffsetInHierarchy(part))
+
+    run: List = []
+    run_zone: Optional[str] = None
+    bracket_count = 0
+
+    def flush():
+        nonlocal run, run_zone, bracket_count
+        if run_zone and run:
+            ott_type = "8va" if run_zone == "high" else "8vb"
+            ott = spanner.Ottava(*run, type=ott_type)
+            part.insert(0, ott)
+
+            # music21's own performTransposition() goes from written pitch
+            # to sounding pitch (up an octave for '8va') — the opposite of
+            # what we need: our notes already hold the true sounding pitch
+            # and we need the *written* (notated) pitch, which is a
+            # semitone-perfect octave shift the other way.
+            shift = -12 if ott_type == "8va" else 12
+            for el in run:
+                el.transpose(shift, inPlace=True)
+            ott.transposing = False
+
+            bracket_count += 1
+            start_q = float(run[0].getOffsetInHierarchy(part))
+            logger.debug(f"{part.id}: {ott_type} bracket over {len(run)} note(s) starting at {start_q:.2f}q")
+        run = []
+        run_zone = None
+
+    for el in elements:
+        zone = _ottava_zone(el, high_threshold, low_threshold)
+        if zone is not None and zone == run_zone:
+            run.append(el)
+        else:
+            flush()
+            if zone is not None:
+                run = [el]
+                run_zone = zone
+
+    flush()
+    return bracket_count
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -403,12 +493,22 @@ def convert(input_json: Path, output_musicxml: Path, output_midi: Path, logger) 
         except Exception as e:
             logger.warning(f"Notation warning: {e}")
 
-    output_musicxml.parent.mkdir(parents=True, exist_ok=True)
-    score.write("musicxml", fp=str(output_musicxml))
-    logger.info(f"Saved MusicXML: {output_musicxml}")
-
+    # MIDI must play back the true detected pitches, so it's written from
+    # this score before any ottava transposition touches it.
+    output_midi.parent.mkdir(parents=True, exist_ok=True)
     score.write("midi", fp=str(output_midi))
     logger.info(f"Saved MIDI: {output_midi}")
+
+    xml_score = copy.deepcopy(score)
+    total_brackets = 0
+    for part in xml_score.parts:
+        total_brackets += apply_ottava_brackets(part, logger)
+    if total_brackets:
+        logger.info(f"Added {total_brackets} 8va/8vb bracket(s) for notes beyond the staff")
+
+    output_musicxml.parent.mkdir(parents=True, exist_ok=True)
+    xml_score.write("musicxml", fp=str(output_musicxml))
+    logger.info(f"Saved MusicXML: {output_musicxml}")
 
     return score
 
