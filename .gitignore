@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated/downloaded artifacts — reproducible from the pipeline, not source.
+data/videos/*
+!data/videos/.gitkeep
+data/logs/*
+!data/logs/.gitkeep
+data/keyboard_map.json
+data/tracked_notes.json
+data/*.png
+data/*.musicxml
+data/*.mid
