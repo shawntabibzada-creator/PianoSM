@@ -12,6 +12,7 @@ import json
 import logging
 import sys
 
+import numpy as np
 import pytest
 
 import calibrate_keymap
@@ -351,3 +352,51 @@ def test_convert_keeps_true_pitch_in_midi_but_shifts_musicxml(tmp_path, logger):
     midi_score = m21converter.parse(str(out_midi))
     midi_pitches = {n.pitch.midi for n in midi_score.recurse().notes}
     assert 96 in midi_pitches, "MIDI playback must keep the true detected pitch, not the notated one"
+
+
+def test_isolated_artifact_far_from_keyboard_is_not_active():
+    """Regression test for a false positive seen on real footage: an
+    isolated colored blob anywhere in the falling-note area (a watermark
+    sliver, a compression artifact) could satisfy every "bright touches
+    the bottom of its own run" check while sitting nowhere near the
+    actual keyboard, and get reported as a currently-played note.
+    analyze_key must also check that the run's bottom is near the real
+    keyboard before calling it active."""
+
+    width = 200
+    keyboard_top = 200
+    cfg = keyboard_detector.DetectorConfig(scale=1.0)
+    key = {"midi": 60, "pitch": "C4", "type": "white", "x": 100.0}
+    half_width = cfg.key_half_width
+
+    general = np.zeros((keyboard_top, width), dtype=bool)
+    right_bright = np.zeros((keyboard_top, width), dtype=bool)
+    left_bright = np.zeros((keyboard_top, width), dtype=bool)
+
+    x1, x2 = 100 - half_width, 100 + half_width + 1
+
+    # An isolated bright blob near the TOP of the frame, far from the
+    # keyboard at row 199 -- tall enough and bright enough to pass every
+    # per-run check on its own.
+    general[0:15, x1:x2] = True
+    right_bright[0:15, x1:x2] = True
+
+    result = keyboard_detector.analyze_key(general, left_bright, right_bright, key, cfg, width, keyboard_top, half_width)
+
+    assert result is not None
+    assert result["active"] is False, "An artifact far from the keyboard must not be reported as a played note"
+
+    # Sanity check the fix doesn't also break real detections: the same
+    # kind of bar, but actually touching the keyboard at the bottom row.
+    general2 = np.zeros((keyboard_top, width), dtype=bool)
+    right_bright2 = np.zeros((keyboard_top, width), dtype=bool)
+    left_bright2 = np.zeros((keyboard_top, width), dtype=bool)
+
+    general2[keyboard_top - 15 : keyboard_top, x1:x2] = True
+    right_bright2[keyboard_top - 15 : keyboard_top, x1:x2] = True
+
+    result2 = keyboard_detector.analyze_key(general2, left_bright2, right_bright2, key, cfg, width, keyboard_top, half_width)
+
+    assert result2 is not None
+    assert result2["active"] is True
+    assert result2["hand"] == "right"

@@ -83,6 +83,15 @@ class DetectorConfig:
     min_bright_rows_base: float = 4.0
     bottom_touch_rows_base: float = 3.0
 
+    # How close a run's own bottom edge must be to the real keyboard for
+    # it to ever count as "currently touching the keys". Without this, an
+    # isolated colored artifact anywhere in the falling-note area (a
+    # watermark sliver, a compression blip) that happens to satisfy the
+    # *relative* bottom-touch check within its own few-pixel-tall run can
+    # be reported as an active note, no matter how far it actually is
+    # from the keyboard.
+    max_keyboard_gap_base: float = 20.0
+
     # Minimum fraction of a sampling column's pixels that must carry the
     # bar color for a row to count as "part of the bar". Fixed at 2 out
     # of 11 columns in the original code; expressed as a ratio here so it
@@ -117,6 +126,10 @@ class DetectorConfig:
     @property
     def min_bright_rows(self) -> int:
         return max(1, int(round(self.min_bright_rows_base * self.scale)))
+
+    @property
+    def max_keyboard_gap(self) -> int:
+        return max(1, int(round(self.max_keyboard_gap_base * self.scale)))
 
     @property
     def bottom_touch_rows(self) -> int:
@@ -556,13 +569,22 @@ def analyze_key(
     left_rows = vertical_run(left_crop)
     right_rows = vertical_run(right_crop)
 
+    # A run can satisfy every "bright touches the bottom of itself" check
+    # while sitting nowhere near the actual keyboard — e.g. a small
+    # isolated artifact elsewhere in the falling-note area. Require the
+    # run's own bottom to be near the real keyboard before it can ever
+    # count as a currently-played note.
+    touches_keyboard = (keyboard_top - 1 - bottom) <= cfg.max_keyboard_gap
+
     left_active = (
-        left_ratio >= cfg.min_bottom_bright_ratio
+        touches_keyboard
+        and left_ratio >= cfg.min_bottom_bright_ratio
         and left_reaches_bottom
         and left_rows >= cfg.min_bright_rows
     )
     right_active = (
-        right_ratio >= cfg.min_bottom_bright_ratio
+        touches_keyboard
+        and right_ratio >= cfg.min_bottom_bright_ratio
         and right_reaches_bottom
         and right_rows >= cfg.min_bright_rows
     )
