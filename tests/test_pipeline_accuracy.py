@@ -400,3 +400,43 @@ def test_isolated_artifact_far_from_keyboard_is_not_active():
     assert result2 is not None
     assert result2["active"] is True
     assert result2["hand"] == "right"
+
+
+def test_hysteresis_survives_one_noisy_frame():
+    """Regression test for a real failure mode: a genuinely sustained note
+    (video-compression noise pushing a couple of frames just under the
+    onset threshold) was getting chopped into dozens of tiny fragments.
+    A key already confirmed active should tolerate a single noisy frame
+    that falls below the onset threshold but still clears a relaxed
+    "sustain" threshold; a key that was NOT already active must not be
+    started by that same noisy-looking frame."""
+
+    cfg = keyboard_detector.DetectorConfig(scale=1.0)
+
+    strong = {
+        "touches_keyboard": True,
+        "left_ratio": 0.9, "right_ratio": 0.0,
+        "left_reaches_bottom": True, "right_reaches_bottom": False,
+        "left_rows": 10, "right_rows": 0,
+    }
+    # Below the onset ratio (0.38) and onset rows (4), but should still
+    # clear the sustain thresholds (0.38*0.45=0.171 ratio, round(4*0.5)=2 rows).
+    noisy = {
+        "touches_keyboard": True,
+        "left_ratio": 0.20, "right_ratio": 0.0,
+        "left_reaches_bottom": True, "right_reaches_bottom": False,
+        "left_rows": 3, "right_rows": 0,
+    }
+
+    is_active, hand = keyboard_detector.decide_active_hand(strong, None, cfg)
+    assert is_active and hand == "left"
+
+    # Continuing an already-active left-hand note through a noisy frame
+    # must survive.
+    is_active, hand = keyboard_detector.decide_active_hand(noisy, "left", cfg)
+    assert is_active and hand == "left"
+
+    # The same noisy-looking frame must NOT be enough to start a brand
+    # new note from scratch.
+    is_active, hand = keyboard_detector.decide_active_hand(noisy, None, cfg)
+    assert not is_active
