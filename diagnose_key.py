@@ -5,7 +5,7 @@ Not part of the normal pipeline -- a debugging tool to see exactly how a
 key's color evolves frame-by-frame during a real press, instead of
 guessing from aggregate calibration numbers. Run it over a time range
 where you know (by ear/eye) a note is being held, and compare the
-printed ratios against what analyze_key requires to call it "active".
+printed ratio against what analyze_key requires to call it "active".
 
 Usage:
     python diagnose_key.py --video path.mp4 --keymap keyboard_map.json --midi 63 --start 3.5 --end 6.5
@@ -26,8 +26,7 @@ def main():
     parser.add_argument("--midi", type=int, required=True, help="MIDI note number to inspect (e.g. 63 for Eb4).")
     parser.add_argument("--start", type=float, required=True, help="Start time in seconds.")
     parser.add_argument("--end", type=float, required=True, help="End time in seconds.")
-    parser.add_argument("--left-hue", type=float, default=None)
-    parser.add_argument("--right-hue", type=float, default=None)
+    parser.add_argument("--hues", type=str, default=None, help="Comma-separated hue values to use instead of automatic calibration.")
     args = parser.parse_args()
 
     import logging
@@ -53,16 +52,15 @@ def main():
     keyboard_top = int(round(reference_keyboard_top * scale))
     cfg = kd.DetectorConfig(scale=scale)
 
-    if args.left_hue is not None and args.right_hue is not None:
-        left_hue, right_hue = args.left_hue, args.right_hue
-        print(f"Using manual hues: left={left_hue} right={right_hue}")
+    if args.hues:
+        hues = [float(x) for x in args.hues.split(",")]
+        print(f"Using manual hues: {', '.join(f'{h:.1f}' for h in hues)}")
     else:
-        left_hue, right_hue, cal_info = kd.learn_bright_hues(video, fps, frame_count, keyboard_top, cfg, logger)
-        print(f"Calibrated hues: left={left_hue:.1f} right={right_hue:.1f}")
+        hues, cal_info = kd.learn_bright_hues(video, fps, frame_count, keyboard_top, cfg, logger)
+        print(f"Calibrated hues: {', '.join(f'{h:.1f}' for h in hues)}")
 
     print(f"min_bright_sat={cfg.min_bright_sat} min_bright_value={cfg.min_bright_value}")
-    print(f"min_bottom_bright_ratio={cfg.min_bottom_bright_ratio} sustain_ratio_factor={cfg.sustain_ratio_factor}")
-    print(f"onset ratio threshold={cfg.min_bottom_bright_ratio:.3f}  sustain ratio threshold={cfg.min_bottom_bright_ratio * cfg.sustain_ratio_factor:.3f}")
+    print(f"onset ratio threshold={cfg.min_bottom_bright_ratio:.3f}")
     print(f"key: midi={key['midi']} pitch={key['pitch']} x={key['x']}")
     print()
 
@@ -72,7 +70,7 @@ def main():
     start_frame = int(round(args.start * fps))
     end_frame = int(round(args.end * fps))
 
-    print(f"{'frame':>6} {'t':>7} {'top':>5} {'bot':>5} {'touchKB':>8} {'L_ratio':>8} {'L_reach':>8} {'L_rows':>7} {'R_ratio':>8} {'R_reach':>8} {'R_rows':>7}")
+    print(f"{'frame':>6} {'t':>7} {'top':>5} {'bot':>5} {'touchKB':>8} {'active':>7} {'ratio':>8} {'reach':>7} {'rows':>6}")
 
     for fi in range(start_frame, end_frame + 1):
         video.set(cv2.CAP_PROP_POS_FRAMES, fi)
@@ -82,11 +80,10 @@ def main():
             continue
 
         hsv = cv2.cvtColor(frame[:keyboard_top], cv2.COLOR_BGR2HSV)
-        general = kd.general_bar_mask(hsv, left_hue, right_hue, cfg)
-        left_bright = kd.bright_mask(hsv, left_hue, cfg)
-        right_bright = kd.bright_mask(hsv, right_hue, cfg)
+        general = kd.general_bar_mask(hsv, hues, cfg)
+        bright = kd.bright_mask(hsv, hues, cfg)
 
-        result = kd.analyze_key(general, left_bright, right_bright, key, cfg, width, keyboard_top, half)
+        result = kd.analyze_key(general, bright, key, cfg, width, keyboard_top, half)
 
         if result is None:
             print(f"{fi:>6} {fi/fps:7.3f}  (no bar found in this column)")
@@ -94,9 +91,8 @@ def main():
 
         print(
             f"{fi:>6} {fi/fps:7.3f} {result['top']:>5} {result['bottom']:>5} "
-            f"{str(result['touches_keyboard']):>8} "
-            f"{result['left_ratio']:>8.3f} {str(result['left_reaches_bottom']):>8} {result['left_rows']:>7} "
-            f"{result['right_ratio']:>8.3f} {str(result['right_reaches_bottom']):>8} {result['right_rows']:>7}"
+            f"{str(result['touches_keyboard']):>8} {str(result['active']):>7} "
+            f"{result['ratio']:>8.3f} {str(result['reaches_bottom']):>7} {result['rows']:>6}"
         )
 
     video.release()
