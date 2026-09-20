@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PianoSM</title>
+<meta name="description" content="Turn a falling-note piano tutorial video into real sheet music.">
+<style>
+  :root {
+    --bg: #0b0b0f;
+    --panel: #14141b;
+    --border: #26262f;
+    --text: #e8e8ee;
+    --muted: #9a9aa8;
+    --accent: #e879b9;
+    --accent-2: #7ea8ff;
+    --mono-bg: #0e0e13;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    line-height: 1.6;
+  }
+
+  .wrap {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+  }
+
+  header.hero {
+    padding: 96px 0 48px;
+    text-align: center;
+  }
+
+  header.hero h1 {
+    font-size: clamp(2.4rem, 6vw, 3.4rem);
+    margin: 0 0 12px;
+    background: linear-gradient(120deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    letter-spacing: -0.02em;
+  }
+
+  header.hero p.tagline {
+    font-size: 1.2rem;
+    color: var(--muted);
+    max-width: 560px;
+    margin: 0 auto;
+  }
+
+  .cta-row {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    margin-top: 32px;
+    flex-wrap: wrap;
+  }
+
+  .btn {
+    display: inline-block;
+    padding: 10px 20px;
+    border-radius: 8px;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 0.95rem;
+    border: 1px solid var(--border);
+    transition: transform 0.15s ease, border-color 0.15s ease;
+  }
+
+  .btn:hover { transform: translateY(-1px); border-color: var(--accent); }
+
+  .btn.primary {
+    background: linear-gradient(120deg, var(--accent), var(--accent-2));
+    color: #0b0b0f;
+    border: none;
+  }
+
+  .btn.ghost { color: var(--text); }
+
+  section { margin-top: 64px; }
+
+  section h2 {
+    font-size: 1.5rem;
+    margin-bottom: 20px;
+    letter-spacing: -0.01em;
+  }
+
+  .pipeline {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+  }
+
+  .step {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+
+  .step .num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: linear-gradient(120deg, var(--accent), var(--accent-2));
+    color: #0b0b0f;
+    font-weight: 700;
+    font-size: 0.85rem;
+    margin-bottom: 12px;
+  }
+
+  .step h3 {
+    margin: 0 0 8px;
+    font-size: 1.05rem;
+  }
+
+  .step p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.92rem;
+  }
+
+  .step code {
+    color: var(--accent-2);
+    background: none;
+    padding: 0;
+    font-size: 0.85rem;
+  }
+
+  pre {
+    background: var(--mono-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 0.88rem;
+  }
+
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  p code, li code {
+    background: var(--mono-bg);
+    border: 1px solid var(--border);
+    padding: 1px 6px;
+    border-radius: 5px;
+    font-size: 0.88em;
+  }
+
+  ul.notes {
+    padding-left: 20px;
+    color: var(--muted);
+  }
+
+  ul.notes li { margin-bottom: 8px; }
+
+  footer {
+    margin-top: 96px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 0.88rem;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  footer a { color: var(--muted); }
+
+  a { color: var(--accent-2); }
+
+  .badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 2px 10px;
+    border-radius: 999px;
+    margin-bottom: 20px;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <span class="badge">falling-note piano tutorial → real sheet music</span>
+      <h1>PianoSM</h1>
+      <p class="tagline">
+        Watches a Synthesia-style tutorial video's falling note colors,
+        tracks exactly when each key is played, and turns that into
+        MusicXML and MIDI sheet music.
+      </p>
+      <div class="cta-row">
+        <a class="btn primary" href="https://github.com/shawntabibzada-creator/PianoSM">View on GitHub</a>
+        <a class="btn ghost" href="#usage">Get started</a>
+      </div>
+    </header>
+
+    <section>
+      <h2>How it works</h2>
+      <div class="pipeline">
+        <div class="step">
+          <span class="num">1</span>
+          <h3>Calibrate</h3>
+          <p>
+            <code>calibrate_keymap.py</code> reads a frame of the video and
+            auto-detects the keyboard's position and all 88 key
+            coordinates, instead of requiring hand-measured pixel
+            positions.
+          </p>
+        </div>
+        <div class="step">
+          <span class="num">2</span>
+          <h3>Detect</h3>
+          <p>
+            <code>keyboard_detector.py</code> watches each key's falling
+            bar switch from its pastel (falling) color to its saturated
+            "played" color right as it reaches the keys, and logs every
+            press and release with exact timing and hand.
+          </p>
+        </div>
+        <div class="step">
+          <span class="num">3</span>
+          <h3>Transcribe</h3>
+          <p>
+            <code>json_to_sheet.py</code> infers tempo from the actual
+            spacing between notes, quantizes to the right rhythmic grid,
+            and writes proper two-hand sheet music with ties and 8va/8vb
+            brackets where needed.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="usage">
+      <h2>Get started</h2>
+      <pre><code>pip install -r requirements.txt
+
+python calibrate_keymap.py --video data/videos/downloaded_video.mp4
+python keyboard_detector.py --url "https://youtube.com/watch?v=..." \
+    --keymap data/keyboard_map.json
+python json_to_sheet.py --input data/tracked_notes.json</code></pre>
+      <p>
+        Every stage writes a log to <code>data/logs/</code>, and
+        <code>keyboard_detector.py</code> also writes a plain per-note
+        <code>note_events.csv</code>, so a run stays inspectable instead
+        of only reporting a final count. Full details are in the
+        <a href="https://github.com/shawntabibzada-creator/PianoSM#readme">README</a>.
+      </p>
+    </section>
+
+    <section>
+      <h2>Worth knowing</h2>
+      <ul class="notes">
+        <li>Every pixel threshold is scaled to the video's actual
+          resolution and adapts to that video's own note colors — a
+          keymap built once can be reused across videos downloaded at
+          whatever resolution YouTube happens to serve.</li>
+        <li>Black-key x-positions from calibration are a geometric
+          approximation, not measured — check the debug overlay image
+          before trusting a run.</li>
+        <li>Same-hand notes are printed as a single line per staff; a
+          sustained note under a moving line gets clipped at the next
+          onset rather than drawn as a second voice.</li>
+      </ul>
+    </section>
+
+    <footer>
+      <span>PianoSM</span>
+      <a href="https://github.com/shawntabibzada-creator/PianoSM">github.com/shawntabibzada-creator/PianoSM</a>
+    </footer>
+  </div>
+</body>
+</html>
