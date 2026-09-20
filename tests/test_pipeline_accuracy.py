@@ -402,41 +402,56 @@ def test_isolated_artifact_far_from_keyboard_is_not_active():
     assert result2["hand"] == "right"
 
 
-def test_hysteresis_survives_one_noisy_frame():
-    """Regression test for a real failure mode: a genuinely sustained note
-    (video-compression noise pushing a couple of frames just under the
-    onset threshold) was getting chopped into dozens of tiny fragments.
-    A key already confirmed active should tolerate a single noisy frame
-    that falls below the onset threshold but still clears a relaxed
-    "sustain" threshold; a key that was NOT already active must not be
-    started by that same noisy-looking frame."""
+def test_sustain_uses_touching_not_brightness():
+    """Regression test for a real failure mode found on actual footage: a
+    single continuously-touching bar (one long sustained note, confirmed
+    frame-by-frame) had its brightness spike to ~1.0 for ~2 frames every
+    0.4-0.7s and sit at exactly 0.0 the rest of the time -- this
+    visualizer pulses the "played" brightness rhythmically rather than
+    holding it constant while a note sustains. Requiring brightness on
+    every frame chopped one long note into dozens of near-zero-length
+    fragments. Continuing an already-active note must only require the
+    bar to still be touching the keyboard, regardless of brightness;
+    starting a brand new note still requires the full onset brightness
+    (needed to tell which hand's color it is)."""
 
     cfg = keyboard_detector.DetectorConfig(scale=1.0)
 
-    strong = {
+    bright_onset = {
         "touches_keyboard": True,
         "left_ratio": 0.9, "right_ratio": 0.0,
         "left_reaches_bottom": True, "right_reaches_bottom": False,
         "left_rows": 10, "right_rows": 0,
     }
-    # Below the onset ratio (0.38) and onset rows (4), but should still
-    # clear the sustain thresholds (0.38*0.45=0.171 ratio, round(4*0.5)=2 rows).
-    noisy = {
+    # Still touching the keyboard, but completely dark -- the "in between
+    # pulses" state observed on real footage.
+    dark_but_touching = {
         "touches_keyboard": True,
-        "left_ratio": 0.20, "right_ratio": 0.0,
-        "left_reaches_bottom": True, "right_reaches_bottom": False,
-        "left_rows": 3, "right_rows": 0,
+        "left_ratio": 0.0, "right_ratio": 0.0,
+        "left_reaches_bottom": False, "right_reaches_bottom": False,
+        "left_rows": 0, "right_rows": 0,
+    }
+    no_longer_touching = {
+        "touches_keyboard": False,
+        "left_ratio": 0.0, "right_ratio": 0.0,
+        "left_reaches_bottom": False, "right_reaches_bottom": False,
+        "left_rows": 0, "right_rows": 0,
     }
 
-    is_active, hand = keyboard_detector.decide_active_hand(strong, None, cfg)
+    is_active, hand = keyboard_detector.decide_active_hand(bright_onset, None, cfg)
     assert is_active and hand == "left"
 
-    # Continuing an already-active left-hand note through a noisy frame
-    # must survive.
-    is_active, hand = keyboard_detector.decide_active_hand(noisy, "left", cfg)
+    # Continuing an already-active left-hand note through a completely
+    # dark (but still touching) frame must survive.
+    is_active, hand = keyboard_detector.decide_active_hand(dark_but_touching, "left", cfg)
     assert is_active and hand == "left"
 
-    # The same noisy-looking frame must NOT be enough to start a brand
-    # new note from scratch.
-    is_active, hand = keyboard_detector.decide_active_hand(noisy, None, cfg)
+    # The same dark frame must NOT be enough to start a brand new note
+    # from scratch.
+    is_active, hand = keyboard_detector.decide_active_hand(dark_but_touching, None, cfg)
+    assert not is_active
+
+    # Once the bar genuinely stops touching the keyboard, the note ends
+    # even if it was previously active.
+    is_active, hand = keyboard_detector.decide_active_hand(no_longer_touching, "left", cfg)
     assert not is_active

@@ -83,14 +83,6 @@ class DetectorConfig:
     min_bright_rows_base: float = 4.0
     bottom_touch_rows_base: float = 3.0
 
-    # Once a key is confirmed active, a single frame of video-compression
-    # noise can knock its bright-pixel ratio just under the onset
-    # threshold on an otherwise continuously-held note, fragmenting one
-    # long note into dozens of tiny ones. Continuing an already-active
-    # note uses this relaxed fraction of the onset thresholds; starting a
-    # brand new note still requires the full, stricter check.
-    sustain_ratio_factor: float = 0.45
-    sustain_rows_factor: float = 0.5
 
     # How close a run's own bottom edge must be to the real keyboard for
     # it to ever count as "currently touching the keys". Without this, an
@@ -98,8 +90,11 @@ class DetectorConfig:
     # watermark sliver, a compression blip) that happens to satisfy the
     # *relative* bottom-touch check within its own few-pixel-tall run can
     # be reported as an active note, no matter how far it actually is
-    # from the keyboard.
-    max_keyboard_gap_base: float = 20.0
+    # from the keyboard. Measured against real footage, a genuinely
+    # touching bar's own reported bottom can jitter by 30-45px frame to
+    # frame (general_bar_mask's row detection isn't pixel-perfect), so a
+    # tight gap here falsely drops "still touching" to "not touching".
+    max_keyboard_gap_base: float = 50.0
 
     # Minimum fraction of a sampling column's pixels that must carry the
     # bar color for a row to count as "part of the bar". Fixed at 2 out
@@ -643,22 +638,24 @@ def analyze_key(
     }
 
 
-def _hand_meets_threshold(ratio: float, reaches_bottom: bool, rows: int, touches_keyboard: bool, cfg: DetectorConfig, sustain: bool) -> bool:
+def _hand_meets_threshold(ratio: float, reaches_bottom: bool, rows: int, touches_keyboard: bool, cfg: DetectorConfig) -> bool:
     if not touches_keyboard:
         return False
 
-    ratio_threshold = cfg.min_bottom_bright_ratio * (cfg.sustain_ratio_factor if sustain else 1.0)
-    rows_threshold = max(1, int(round(cfg.min_bright_rows * (cfg.sustain_rows_factor if sustain else 1.0))))
-
-    return ratio >= ratio_threshold and reaches_bottom and rows >= rows_threshold
+    return ratio >= cfg.min_bottom_bright_ratio and reaches_bottom and rows >= cfg.min_bright_rows
 
 
 def decide_active_hand(result: Optional[dict], prior_hand: Optional[str], cfg: DetectorConfig) -> Tuple[bool, Optional[str]]:
-    """Hysteresis: a key already confirmed active for `prior_hand` only
-    needs to clear the relaxed "sustain" threshold to keep going, so one
-    noisy frame in the middle of a genuinely held note doesn't chop it
-    into fragments. Starting a new note (prior_hand is None, or the other
-    hand is taking over) still requires the full onset threshold.
+    """Starting a new note requires the full onset brightness threshold
+    (needed to tell which hand's color this is, since the general bar
+    mask matches both hues at once). Continuing a note already confirmed
+    active only requires the bar to still be touching the keyboard, not
+    brightness at all: some visualizers pulse the "played" brightness
+    rhythmically rather than holding it constant while a note sustains,
+    confirmed against real per-frame data (a single continuously-touching
+    bar with brightness spiking for ~2 frames every 0.4-0.7s and sitting
+    at exactly 0 in between). Requiring brightness on every frame chopped
+    one long sustained note into dozens of near-zero-length fragments.
     """
 
     if result is None:
@@ -666,21 +663,14 @@ def decide_active_hand(result: Optional[dict], prior_hand: Optional[str], cfg: D
 
     touches_keyboard = result["touches_keyboard"]
 
-    if prior_hand == "left" and _hand_meets_threshold(
-        result["left_ratio"], result["left_reaches_bottom"], result["left_rows"], touches_keyboard, cfg, sustain=True
-    ):
-        return True, "left"
-
-    if prior_hand == "right" and _hand_meets_threshold(
-        result["right_ratio"], result["right_reaches_bottom"], result["right_rows"], touches_keyboard, cfg, sustain=True
-    ):
-        return True, "right"
+    if prior_hand is not None and touches_keyboard:
+        return True, prior_hand
 
     left_onset = _hand_meets_threshold(
-        result["left_ratio"], result["left_reaches_bottom"], result["left_rows"], touches_keyboard, cfg, sustain=False
+        result["left_ratio"], result["left_reaches_bottom"], result["left_rows"], touches_keyboard, cfg
     )
     right_onset = _hand_meets_threshold(
-        result["right_ratio"], result["right_reaches_bottom"], result["right_rows"], touches_keyboard, cfg, sustain=False
+        result["right_ratio"], result["right_reaches_bottom"], result["right_rows"], touches_keyboard, cfg
     )
 
     if left_onset and right_onset:
