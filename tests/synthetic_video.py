@@ -10,7 +10,7 @@ generating a keymap from one resolution and detecting against another.
 """
 
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -68,22 +68,28 @@ def render_video(
     duration_s: float,
     ground_truth: List[dict],
     keys: List[dict],
-    left_hue: int = 85,
-    right_hue: int = 150,
+    hue_map: Optional[Dict[str, int]] = None,
 ):
-    """ground_truth: list of {midi, start, end, hand} dicts."""
+    """ground_truth: list of {midi, start, end, hand, color?} dicts.
+
+    `color` selects which entry of `hue_map` a note is rendered in; if
+    omitted, falls back to the note's `hand` (so old two-hue tests that
+    never set `color` keep working unchanged). `hue_map` defaults to the
+    original two-hue {"left": 85, "right": 150} scheme, but callers can
+    pass a third (or more) distinctly-hued entry to exercise multi-color
+    detection, mirroring a real video that uses more than two colors for
+    reasons unrelated to hand (a white/black-key color variant, a
+    sustained-voice highlight, etc.).
+    """
+
+    if hue_map is None:
+        hue_map = {"left": 85, "right": 150}
 
     keyboard_top, left_edge, right_edge = scene_geometry(width, height)
     key_by_midi = {k["midi"]: k for k in keys}
 
-    pastel = {
-        "left": hsv_to_bgr(left_hue, 130, 195),
-        "right": hsv_to_bgr(right_hue, 130, 195),
-    }
-    bright = {
-        "left": hsv_to_bgr(left_hue, 235, 235),
-        "right": hsv_to_bgr(right_hue, 235, 235),
-    }
+    pastel = {name: hsv_to_bgr(hue, 130, 195) for name, hue in hue_map.items()}
+    bright = {name: hsv_to_bgr(hue, 235, 235) for name, hue in hue_map.items()}
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height))
@@ -106,7 +112,8 @@ def render_video(
             key = key_by_midi[note["midi"]]
             cx = int(round(key["x"]))
 
-            start, end, hand = note["start"], note["end"], note["hand"]
+            start, end = note["start"], note["end"]
+            color_key = note.get("color", note["hand"])
 
             full_bottom = keyboard_top - speed * (start - t)
             full_top = keyboard_top - speed * (end - t)
@@ -123,7 +130,7 @@ def render_video(
             # a frame boundary can compare on the wrong side by ~1e-13.
             # Nudge the comparison so the intended frame renders bright.
             eps = 1e-6
-            color = bright[hand] if (start - eps) <= t < (end - eps) else pastel[hand]
+            color = bright[color_key] if (start - eps) <= t < (end - eps) else pastel[color_key]
 
             cv2.rectangle(
                 frame,

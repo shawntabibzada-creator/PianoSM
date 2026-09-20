@@ -5,9 +5,9 @@ video.
 The visualizer draws two appearances for a falling note bar:
 
     UNPLAYED = pastel/light bar color
-    PLAYED   = saturated bright hand color
+    PLAYED   = saturated bright color
 
-A note is "played" when the bright hand-color region is attached to the
+A note is "played" when the bright color region is attached to the
 bottom edge of the falling bar (i.e. the bar is touching the keybed), not
 just whenever a bright pixel appears anywhere in frame. This module finds,
 for every one of the 88 keys, the falling bar nearest the keyboard and asks
@@ -23,6 +23,15 @@ Compared to the original prototype this version fixes:
     against silence or missed the bright color range entirely.
   * The "is this bar's column real" check used a fixed pixel-count
     threshold regardless of how wide the sampling column actually was.
+  * Calibration hardcoded exactly two colors ("left hand"/"right hand").
+    Some tutorials use a third (or more) distinct color for reasons that
+    have nothing to do with which hand is playing -- a sustained/pedal
+    voice, a highlight color, etc. -- and that whole voice went completely
+    undetected, since only the two strongest hue peaks were ever kept.
+    Detection now tracks however many distinct colors the video actually
+    uses; which staff a note is notated on is decided by its pitch (the
+    standard convention when true hand data isn't available), not by
+    which of those colors it happened to be drawn in.
   * Nothing was logged beyond a final count, so a wrong run was
     unreviewable after the fact.
 """
@@ -49,10 +58,18 @@ from common import (
 
 KEYBOARD_TOP_1080P = 722
 
-# Learned colors from the reference video, used only if automatic
-# calibration fails to find two well-separated hue peaks.
-FALLBACK_LEFT_HUE = 83.9
-FALLBACK_RIGHT_HUE = 150.4
+# Used only if calibration can't find any distinct hue peak at all.
+FALLBACK_HUES = [83.9, 150.4]
+
+# How many distinct note-bar colors to look for. Two is the common case
+# (one per hand), but some tutorials add a third or fourth color for a
+# sustained/pedal voice, a highlight, etc. -- missing one of those means
+# an entire voice goes undetected.
+MAX_HUES = 4
+
+# Hue peaks closer together than this (out of 180) are treated as the
+# same color rather than two distinct ones.
+MIN_HUE_SEPARATION = 25.0
 
 
 @dataclass
@@ -82,7 +99,6 @@ class DetectorConfig:
     min_bottom_bright_ratio: float = 0.38
     min_bright_rows_base: float = 4.0
     bottom_touch_rows_base: float = 3.0
-
 
     # How close a run's own bottom edge must be to the real keyboard for
     # it to ever count as "currently touching the keys". Without this, an
@@ -114,6 +130,13 @@ class DetectorConfig:
     press_confirm_frames: int = 1
     release_confirm_frames: int = 3
     min_note_frames: int = 2
+
+    # Notes at or above this MIDI number are notated on the treble staff,
+    # below on the bass staff (60 = middle C). Which color a video draws a
+    # note in doesn't reliably indicate hand -- see MAX_HUES above -- so
+    # staff assignment is decided by pitch instead, same as most
+    # auto-transcription tools do when true hand data isn't available.
+    hand_split_midi: int = 60
 
     @property
     def key_half_width(self) -> int:
@@ -150,24 +173,30 @@ def hue_distance(h: np.ndarray, target: float) -> np.ndarray:
     return np.minimum(d, 180.0 - d)
 
 
-def clamp_hue_tolerance_for_separation(cfg: DetectorConfig, left_hue: float, right_hue: float, logger) -> None:
-    """If the two hand colors happen to be close together on the hue
-    wheel, the default tolerances can make their "is this pixel this
-    hand's color" zones overlap, so a pixel near the midpoint gets
-    matched as both hands (or neither cleanly). Shrink the tolerances in
-    place so the two zones never touch, whatever the calibrated hues
-    turn out to be.
+def clamp_hue_tolerance_for_separation(cfg: DetectorConfig, hues: List[float], logger) -> None:
+    """If two of the tracked colors happen to be close together on the
+    hue wheel, the default tolerances can make their "is this pixel this
+    color" zones overlap, so a pixel near the midpoint gets matched as
+    both (or neither cleanly). Shrink the tolerances in place so no two
+    zones can touch, whatever the calibrated hues turn out to be.
     """
 
-    gap = min(abs(left_hue - right_hue), 180.0 - abs(left_hue - right_hue))
+    if len(hues) < 2:
+        return
+
+    min_gap = min(
+        min(abs(hues[i] - hues[j]), 180.0 - abs(hues[i] - hues[j]))
+        for i in range(len(hues))
+        for j in range(i + 1, len(hues))
+    )
     safety_margin = 2.0
-    max_safe = max(3.0, gap / 2.0 - safety_margin)
+    max_safe = max(3.0, min_gap / 2.0 - safety_margin)
 
     if cfg.hue_tolerance > max_safe or cfg.general_hue_tolerance > max_safe:
         logger.warning(
-            f"Calibrated hues are only {gap:.1f} degrees apart; shrinking hue tolerance "
+            f"Calibrated hues are only {min_gap:.1f} degrees apart at closest; shrinking hue tolerance "
             f"{cfg.hue_tolerance:.1f}/{cfg.general_hue_tolerance:.1f} -> {max_safe:.1f} "
-            "so one hand's color can't be matched as the other's."
+            "so one color can't be matched as another."
         )
         cfg.hue_tolerance = min(cfg.hue_tolerance, max_safe)
         cfg.general_hue_tolerance = min(cfg.general_hue_tolerance, max_safe)
@@ -178,23 +207,21 @@ def clamp_hue_tolerance_for_separation(cfg: DetectorConfig, left_hue: float, rig
 # ============================================================
 
 
-def general_bar_mask(hsv: np.ndarray, left_hue: float, right_hue: float, cfg: DetectorConfig) -> np.ndarray:
+def _any_hue_mask(h: np.ndarray, hues: List[float], tolerance: float) -> np.ndarray:
+    mask = np.zeros(h.shape, dtype=bool)
+    for hue in hues:
+        mask |= hue_distance(h, hue) <= tolerance
+    return mask
+
+
+def general_bar_mask(hsv: np.ndarray, hues: List[float], cfg: DetectorConfig) -> np.ndarray:
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-
-    left_color = hue_distance(h, left_hue) <= cfg.general_hue_tolerance
-    right_color = hue_distance(h, right_hue) <= cfg.general_hue_tolerance
-
-    return (s >= cfg.min_bar_sat) & (v >= cfg.min_bar_value) & (left_color | right_color)
+    return (s >= cfg.min_bar_sat) & (v >= cfg.min_bar_value) & _any_hue_mask(h, hues, cfg.general_hue_tolerance)
 
 
-def bright_mask(hsv: np.ndarray, hue: float, cfg: DetectorConfig) -> np.ndarray:
+def bright_mask(hsv: np.ndarray, hues: List[float], cfg: DetectorConfig) -> np.ndarray:
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-
-    return (
-        (s >= cfg.min_bright_sat)
-        & (v >= cfg.min_bright_value)
-        & (hue_distance(h, hue) <= cfg.hue_tolerance)
-    )
+    return (s >= cfg.min_bright_sat) & (v >= cfg.min_bright_value) & _any_hue_mask(h, hues, cfg.hue_tolerance)
 
 
 # ============================================================
@@ -206,8 +233,7 @@ def _adapt_bright_thresholds(
     video: cv2.VideoCapture,
     scanned_indices: List[int],
     keyboard_top: int,
-    color_a: float,
-    color_b: float,
+    hues: List[float],
     cfg: DetectorConfig,
     logger,
     min_samples: int = 200,
@@ -236,10 +262,7 @@ def _adapt_bright_thresholds(
         h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
 
         bar = (s >= cfg.min_bar_sat) & (v >= cfg.min_bar_value)
-        near_hue = (hue_distance(h, color_a) <= cfg.general_hue_tolerance) | (
-            hue_distance(h, color_b) <= cfg.general_hue_tolerance
-        )
-        mask = bar & near_hue
+        mask = bar & _any_hue_mask(h, hues, cfg.general_hue_tolerance)
 
         if np.any(mask):
             sat_samples.append(s[mask])
@@ -293,10 +316,13 @@ def learn_bright_hues(
     max_scan_seconds: float = 30.0,
     target_bar_px: int = 4000,
     min_frames_scanned: int = 6,
-) -> Tuple[float, float, dict]:
+    max_hues: int = MAX_HUES,
+) -> Tuple[List[float], dict]:
     """Scan forward from the start of the video, accumulating a hue
-    histogram of bright ("played") pixels, until either enough bright
-    pixels have been seen or `max_scan_seconds` is exhausted.
+    histogram of bar-colored pixels, until either enough pixels have been
+    seen or `max_scan_seconds` is exhausted, then keep up to `max_hues`
+    well-separated peaks -- however many distinct colors the video
+    actually uses, not a hardcoded two.
 
     The original version only ever looked at 2.8s-6.5s, which assumed
     every video's first note lands in that window. Some intros are
@@ -356,97 +382,36 @@ def learn_bright_hues(
 
     peaks = sorted(((smooth[hue], hue) for hue in range(180)), reverse=True)
 
-    candidate_hues: List[int] = []
+    candidate_hues: List[float] = []
     for strength, hue in peaks:
         if strength <= 0:
             break
-        if all(min(abs(hue - old), 180 - abs(hue - old)) >= 25 for old in candidate_hues):
-            candidate_hues.append(int(hue))
-        if len(candidate_hues) >= 2:
+        if all(min(abs(hue - old), 180 - abs(hue - old)) >= MIN_HUE_SEPARATION for old in candidate_hues):
+            candidate_hues.append(float(hue))
+        if len(candidate_hues) >= max_hues:
             break
 
-    if len(candidate_hues) >= 2:
-        color_a, color_b = float(candidate_hues[0]), float(candidate_hues[1])
+    if candidate_hues:
+        hues = candidate_hues
         used_fallback = False
     else:
-        color_a, color_b = FALLBACK_LEFT_HUE, FALLBACK_RIGHT_HUE
+        hues = list(FALLBACK_HUES)
         used_fallback = True
-        logger.warning("Could not find two distinct hue peaks; using fallback hues")
+        logger.warning("Could not find any distinct hue peaks; using fallback hues")
 
-    clamp_hue_tolerance_for_separation(cfg, color_a, color_b, logger)
-    _adapt_bright_thresholds(video, scanned_indices, keyboard_top, color_a, color_b, cfg, logger)
+    clamp_hue_tolerance_for_separation(cfg, hues, logger)
+    _adapt_bright_thresholds(video, scanned_indices, keyboard_top, hues, cfg, logger)
 
-    # Determine left/right by x location of *currently played* (bright)
-    # pixels. This needs its own scan, separate from the hue-histogram
-    # frames above: those stop as soon as they've seen enough general
-    # bar-color pixels (which are almost always present, since falling
-    # notes are on screen continuously), but a currently-played moment is
-    # much rarer, so that small, early batch of frames can easily contain
-    # zero of them — especially now that the bright threshold is the
-    # tighter, adapted one. Keep scanning across the full window until
-    # enough played-pixel samples are found for both colors.
-    x_sums = [0.0, 0.0]
-    x_counts = [0, 0]
-    min_x_samples = 150
-    x_step = max(1, int(round(fps / 10)))
-
-    for fi in range(0, max_frame + 1, x_step):
-        if min(x_counts) >= min_x_samples:
-            break
-
-        video.set(cv2.CAP_PROP_POS_FRAMES, fi)
-        ok, frame = video.read()
-
-        if not ok:
-            continue
-
-        hsv = cv2.cvtColor(frame[:keyboard_top], cv2.COLOR_BGR2HSV)
-        h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-
-        bright = (s >= cfg.min_bright_sat) & (v >= cfg.min_bright_value)
-        yy, xx = np.nonzero(bright)
-
-        if len(xx) == 0:
-            continue
-
-        observed = h[yy, xx].astype(np.float32)
-
-        for i, target in enumerate([color_a, color_b]):
-            d = np.minimum(np.abs(observed - target), 180.0 - np.abs(observed - target))
-            m = d <= cfg.hue_tolerance
-
-            if np.any(m):
-                x_sums[i] += float(xx[m].sum())
-                x_counts[i] += int(np.count_nonzero(m))
-
-    means = [(x_sums[i] / x_counts[i] if x_counts[i] else float("inf")) for i in range(2)]
-
-    if np.isfinite(means[0]) and np.isfinite(means[1]):
-        if means[0] <= means[1]:
-            left_hue, right_hue = color_a, color_b
-        else:
-            left_hue, right_hue = color_b, color_a
-    else:
-        # Still use the hues actually found in THIS video, not the
-        # unrelated fallback constants (tuned on a different reference
-        # video entirely) — being unsure which hand is which is a much
-        # smaller problem than detecting against the wrong colors.
-        left_hue, right_hue = color_a, color_b
-        logger.warning(
-            "Could not determine which color is which hand by x-position "
-            f"(counts={x_counts}); defaulting to left={left_hue:.1f} right={right_hue:.1f} "
-            "-- hands may be swapped, check the debug image."
-        )
+    logger.info(f"Detected {len(hues)} distinct note-bar color(s): {', '.join(f'{h:.1f}' for h in hues)}")
 
     info = {
-        "left_hue": left_hue,
-        "right_hue": right_hue,
+        "hues": hues,
         "used_fallback": used_fallback,
         "frames_scanned": len(scanned_indices),
         "bar_pixels_seen": total_bar_px,
     }
 
-    return left_hue, right_hue, info
+    return hues, info
 
 
 # ============================================================
@@ -504,8 +469,7 @@ def compute_key_half_widths(keys: List[dict], cfg: DetectorConfig) -> Dict[int, 
 
 def analyze_key(
     general: np.ndarray,
-    left_bright: np.ndarray,
-    right_bright: np.ndarray,
+    bright: np.ndarray,
     key: dict,
     cfg: DetectorConfig,
     width: int,
@@ -567,30 +531,18 @@ def analyze_key(
     # actually distinguishes a real played bar from noise, so no extra
     # height cap is applied here.
 
-    left_crop = left_bright[top : bottom + 1, x1:x2]
-    right_crop = right_bright[top : bottom + 1, x1:x2]
+    bright_crop = bright[top : bottom + 1, x1:x2]
 
     band_height = min(cfg.bottom_band_pixels, bottom - top + 1)
     by1 = bottom - band_height + 1
 
-    left_bottom = left_bright[by1 : bottom + 1, x1:x2]
-    right_bottom = right_bright[by1 : bottom + 1, x1:x2]
+    bright_bottom = bright[by1 : bottom + 1, x1:x2]
+    ratio = float(np.mean(bright_bottom)) if bright_bottom.size else 0.0
 
-    left_ratio = float(np.mean(left_bottom)) if left_bottom.size else 0.0
-    right_ratio = float(np.mean(right_bottom)) if right_bottom.size else 0.0
+    bright_ys = np.nonzero(bright[top : bottom + 1, x1:x2])[0]
+    reaches_bottom = len(bright_ys) > 0 and (bottom - (top + int(bright_ys.max())) <= cfg.bottom_touch_rows)
 
-    left_ys = np.nonzero(left_bright[top : bottom + 1, x1:x2])[0]
-    right_ys = np.nonzero(right_bright[top : bottom + 1, x1:x2])[0]
-
-    left_reaches_bottom = len(left_ys) > 0 and (
-        bottom - (top + int(left_ys.max())) <= cfg.bottom_touch_rows
-    )
-    right_reaches_bottom = len(right_ys) > 0 and (
-        bottom - (top + int(right_ys.max())) <= cfg.bottom_touch_rows
-    )
-
-    left_rows = vertical_run(left_crop)
-    right_rows = vertical_run(right_crop)
+    rows = vertical_run(bright_crop)
 
     # A run can satisfy every "bright touches the bottom of itself" check
     # while sitting nowhere near the actual keyboard — e.g. a small
@@ -599,88 +551,43 @@ def analyze_key(
     # count as a currently-played note.
     touches_keyboard = (keyboard_top - 1 - bottom) <= cfg.max_keyboard_gap
 
-    # "active"/"hand" below use the full, strict (onset) thresholds --
-    # right for a single-frame debug snapshot, which is all these two
-    # fields are used for now. track_video applies its own hysteresis
-    # (see _hand_meets_threshold) using the raw per-hand fields instead,
-    # so a note already confirmed playing can survive a single noisy
-    # frame without being chopped into fragments.
-    left_active = (
+    active = (
         touches_keyboard
-        and left_ratio >= cfg.min_bottom_bright_ratio
-        and left_reaches_bottom
-        and left_rows >= cfg.min_bright_rows
+        and ratio >= cfg.min_bottom_bright_ratio
+        and reaches_bottom
+        and rows >= cfg.min_bright_rows
     )
-    right_active = (
-        touches_keyboard
-        and right_ratio >= cfg.min_bottom_bright_ratio
-        and right_reaches_bottom
-        and right_rows >= cfg.min_bright_rows
-    )
-
-    active = left_active or right_active
-    hand = None
-    if active:
-        hand = "left" if (left_active and (not right_active or left_ratio >= right_ratio)) else "right"
 
     return {
         "active": active,
-        "hand": hand,
         "top": top,
         "bottom": bottom,
         "touches_keyboard": touches_keyboard,
-        "left_ratio": left_ratio,
-        "right_ratio": right_ratio,
-        "left_reaches_bottom": left_reaches_bottom,
-        "right_reaches_bottom": right_reaches_bottom,
-        "left_rows": left_rows,
-        "right_rows": right_rows,
+        "ratio": ratio,
+        "reaches_bottom": reaches_bottom,
+        "rows": rows,
     }
 
 
-def _hand_meets_threshold(ratio: float, reaches_bottom: bool, rows: int, touches_keyboard: bool, cfg: DetectorConfig) -> bool:
-    if not touches_keyboard:
-        return False
-
-    return ratio >= cfg.min_bottom_bright_ratio and reaches_bottom and rows >= cfg.min_bright_rows
-
-
-def decide_active_hand(result: Optional[dict], prior_hand: Optional[str], cfg: DetectorConfig) -> Tuple[bool, Optional[str]]:
+def decide_active(result: Optional[dict], was_active: bool, cfg: DetectorConfig) -> bool:
     """Starting a new note requires the full onset brightness threshold
-    (needed to tell which hand's color this is, since the general bar
-    mask matches both hues at once). Continuing a note already confirmed
-    active only requires the bar to still be touching the keyboard, not
-    brightness at all: some visualizers pulse the "played" brightness
-    rhythmically rather than holding it constant while a note sustains,
-    confirmed against real per-frame data (a single continuously-touching
-    bar with brightness spiking for ~2 frames every 0.4-0.7s and sitting
-    at exactly 0 in between). Requiring brightness on every frame chopped
+    (`result["active"]`). Continuing a note already confirmed active only
+    requires the bar to still be touching the keyboard, not brightness at
+    all: some visualizers pulse the "played" brightness rhythmically
+    rather than holding it constant while a note sustains, confirmed
+    against real per-frame data (a single continuously-touching bar with
+    brightness spiking for ~2 frames every 0.4-0.7s and sitting at
+    exactly 0 in between). Requiring brightness on every frame chopped
     one long sustained note into dozens of near-zero-length fragments.
     """
 
     if result is None:
-        return False, None
+        return False
 
-    touches_keyboard = result["touches_keyboard"]
+    if was_active and result["touches_keyboard"]:
+        return True
 
-    if prior_hand is not None and touches_keyboard:
-        return True, prior_hand
-
-    left_onset = _hand_meets_threshold(
-        result["left_ratio"], result["left_reaches_bottom"], result["left_rows"], touches_keyboard, cfg
-    )
-    right_onset = _hand_meets_threshold(
-        result["right_ratio"], result["right_reaches_bottom"], result["right_rows"], touches_keyboard, cfg
-    )
-
-    if left_onset and right_onset:
-        return True, ("left" if result["left_ratio"] >= result["right_ratio"] else "right")
-    if left_onset:
-        return True, "left"
-    if right_onset:
-        return True, "right"
-
-    return False, None
+    return result["active"]
 
 
 # ============================================================
@@ -694,11 +601,9 @@ def make_states(keys: List[dict]) -> Dict[int, dict]:
         states[key["midi"]] = {
             "key": key,
             "active": False,
-            "hand": None,
             "start": None,
             "last": None,
             "off": 0,
-            "candidate_hand": None,
             "candidate_start": None,
             "candidate_count": 0,
         }
@@ -723,12 +628,13 @@ def close_note(state: dict, notes: list, fps: float, cfg: DetectorConfig, logger
     if count >= cfg.min_note_frames:
         start_time = start / fps
         end_time = (final_frame + 1) / fps
+        hand = "left" if state["key"]["midi"] < cfg.hand_split_midi else "right"
 
         note = {
             "pitch": state["key"]["pitch"],
             "midi": int(state["key"]["midi"]),
             "type": state["key"]["type"],
-            "hand": state["hand"],
+            "hand": hand,
             "start_frame": int(start),
             "end_frame": int(final_frame),
             "start_time": float(start_time),
@@ -739,16 +645,14 @@ def close_note(state: dict, notes: list, fps: float, cfg: DetectorConfig, logger
 
         if logger is not None:
             logger.debug(
-                f"RELEASE {note['pitch']:<4} hand={note['hand']:<5} "
+                f"RELEASE {note['pitch']:<4} hand={hand:<5} "
                 f"start={note['start_time']:.3f}s dur={note['duration']:.3f}s"
             )
 
     state["active"] = False
-    state["hand"] = None
     state["start"] = None
     state["last"] = None
     state["off"] = 0
-    state["candidate_hand"] = None
     state["candidate_start"] = None
     state["candidate_count"] = 0
 
@@ -756,8 +660,7 @@ def close_note(state: dict, notes: list, fps: float, cfg: DetectorConfig, logger
 def track_video(
     video: cv2.VideoCapture,
     keys: List[dict],
-    left_hue: float,
-    right_hue: float,
+    hues: List[float],
     cfg: DetectorConfig,
     fps: float,
     frame_count: int,
@@ -781,54 +684,40 @@ def track_video(
 
         hsv = cv2.cvtColor(frame[:keyboard_top], cv2.COLOR_BGR2HSV)
 
-        general = general_bar_mask(hsv, left_hue, right_hue, cfg)
-        left_bright = bright_mask(hsv, left_hue, cfg)
-        right_bright = bright_mask(hsv, right_hue, cfg)
+        general = general_bar_mask(hsv, hues, cfg)
+        bright = bright_mask(hsv, hues, cfg)
 
         for midi, state in states.items():
-            result = analyze_key(
-                general, left_bright, right_bright, state["key"], cfg, width, keyboard_top,
-                half_widths[midi],
-            )
-            prior_hand = state["hand"] if state["active"] else None
-            is_active, hand = decide_active_hand(result, prior_hand, cfg)
+            result = analyze_key(general, bright, state["key"], cfg, width, keyboard_top, half_widths[midi])
+            is_active = decide_active(result, state["active"], cfg)
 
             if is_active:
                 state["off"] = 0
 
-                if state["active"] and state["hand"] == hand:
+                if state["active"]:
                     state["last"] = frame_number
                     continue
 
-                if state["active"] and state["hand"] != hand:
-                    close_note(state, notes, fps, cfg, logger)
-
-                if state["candidate_hand"] == hand:
-                    state["candidate_count"] += 1
-                else:
-                    state["candidate_hand"] = hand
+                if state["candidate_start"] is None:
                     state["candidate_start"] = frame_number
-                    state["candidate_count"] = 1
+                state["candidate_count"] += 1
 
                 if state["candidate_count"] >= cfg.press_confirm_frames:
                     state["active"] = True
-                    state["hand"] = hand
                     state["start"] = state["candidate_start"]
                     state["last"] = frame_number
                     state["off"] = 0
 
                     if logger is not None:
                         logger.debug(
-                            f"PRESS   {state['key']['pitch']:<4} hand={hand:<5} "
+                            f"PRESS   {state['key']['pitch']:<4} "
                             f"frame={state['start']} t={state['start']/fps:.3f}s"
                         )
 
-                    state["candidate_hand"] = None
                     state["candidate_start"] = None
                     state["candidate_count"] = 0
 
             else:
-                state["candidate_hand"] = None
                 state["candidate_start"] = None
                 state["candidate_count"] = 0
 
@@ -921,8 +810,7 @@ def download_video(url: str, out_path: Path, logger) -> None:
 def write_debug_image(
     video: cv2.VideoCapture,
     keys: List[dict],
-    left_hue: float,
-    right_hue: float,
+    hues: List[float],
     cfg: DetectorConfig,
     fps: float,
     width: int,
@@ -940,9 +828,8 @@ def write_debug_image(
         return
 
     hsv = cv2.cvtColor(debug_frame[:keyboard_top], cv2.COLOR_BGR2HSV)
-    gm = general_bar_mask(hsv, left_hue, right_hue, cfg)
-    lm = bright_mask(hsv, left_hue, cfg)
-    rm = bright_mask(hsv, right_hue, cfg)
+    gm = general_bar_mask(hsv, hues, cfg)
+    bm = bright_mask(hsv, hues, cfg)
 
     debug = debug_frame.copy()
     active = []
@@ -950,13 +837,14 @@ def write_debug_image(
 
     for key in keys:
         half = half_widths[key["midi"]]
-        result = analyze_key(gm, lm, rm, key, cfg, width, keyboard_top, half)
+        result = analyze_key(gm, bm, key, cfg, width, keyboard_top, half)
         cx = int(round(key["x"] * cfg.scale))
 
         if result and result["active"]:
-            border = (255, 80, 0) if result["hand"] == "left" else (255, 0, 255)
+            hand = "left" if key["midi"] < cfg.hand_split_midi else "right"
+            border = (255, 80, 0) if hand == "left" else (255, 0, 255)
             thickness = 4
-            active.append(f"{key['pitch']} {result['hand']} {result['bottom']}")
+            active.append(f"{key['pitch']} {hand} {result['bottom']}")
         else:
             border = (80, 80, 80)
             thickness = 1
@@ -999,8 +887,7 @@ def write_debug_image(
 def find_first_active_time(
     video: cv2.VideoCapture,
     keys: List[dict],
-    left_hue: float,
-    right_hue: float,
+    hues: List[float],
     cfg: DetectorConfig,
     fps: float,
     frame_count: int,
@@ -1023,12 +910,11 @@ def find_first_active_time(
             continue
 
         hsv = cv2.cvtColor(frame[:keyboard_top], cv2.COLOR_BGR2HSV)
-        gm = general_bar_mask(hsv, left_hue, right_hue, cfg)
-        lm = bright_mask(hsv, left_hue, cfg)
-        rm = bright_mask(hsv, right_hue, cfg)
+        gm = general_bar_mask(hsv, hues, cfg)
+        bm = bright_mask(hsv, hues, cfg)
 
         for key in keys:
-            result = analyze_key(gm, lm, rm, key, cfg, width, keyboard_top, half_widths[key["midi"]])
+            result = analyze_key(gm, bm, key, cfg, width, keyboard_top, half_widths[key["midi"]])
             if result and result["active"]:
                 return fi / fps
 
@@ -1047,8 +933,8 @@ def main(argv=None):
     parser.add_argument("--keymap", default=str(DEFAULT_KEYMAP_PATH))
     parser.add_argument("--out", default=str(DEFAULT_TRACKED_JSON))
     parser.add_argument("--debug-image", default=str(DEFAULT_DEBUG_IMAGE))
-    parser.add_argument("--left-hue", type=float, default=None, help="Override automatic hue calibration.")
-    parser.add_argument("--right-hue", type=float, default=None, help="Override automatic hue calibration.")
+    parser.add_argument("--hues", type=str, default=None, help="Comma-separated hue values (0-179) to use instead of automatic calibration, e.g. '149,175,90'.")
+    parser.add_argument("--hand-split-midi", type=int, default=None, help="MIDI note number at/above which notes are notated on the treble staff (default 60 = middle C).")
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1092,23 +978,25 @@ def main(argv=None):
     logger.info(f"Keyboard top: y={keyboard_top} (reference {reference_keyboard_top} @ {reference_height}p)")
 
     cfg = DetectorConfig(scale=scale)
+    if args.hand_split_midi is not None:
+        cfg.hand_split_midi = args.hand_split_midi
 
-    if args.left_hue is not None and args.right_hue is not None:
-        left_hue, right_hue = args.left_hue, args.right_hue
-        cal_info = {"left_hue": left_hue, "right_hue": right_hue, "used_fallback": False, "manual_override": True}
-        logger.info(f"Using manually specified hues: left={left_hue:.1f} right={right_hue:.1f}")
-        clamp_hue_tolerance_for_separation(cfg, left_hue, right_hue, logger)
+    if args.hues:
+        hues = [float(x) for x in args.hues.split(",")]
+        cal_info = {"hues": hues, "used_fallback": False, "manual_override": True}
+        logger.info(f"Using manually specified hues: {', '.join(f'{h:.1f}' for h in hues)}")
+        clamp_hue_tolerance_for_separation(cfg, hues, logger)
     else:
-        left_hue, right_hue, cal_info = learn_bright_hues(video, fps, frame_count, keyboard_top, cfg, logger)
-        logger.info(f"Calibrated hues: left={left_hue:.1f} right={right_hue:.1f} (fallback={cal_info['used_fallback']})")
+        hues, cal_info = learn_bright_hues(video, fps, frame_count, keyboard_top, cfg, logger)
+        logger.info(f"Calibrated hues: {', '.join(f'{h:.1f}' for h in hues)} (fallback={cal_info['used_fallback']})")
 
-    debug_time = find_first_active_time(video, keys, left_hue, right_hue, cfg, fps, frame_count, width, keyboard_top)
-    write_debug_image(video, keys, left_hue, right_hue, cfg, fps, width, keyboard_top, debug_path, debug_time, logger)
+    debug_time = find_first_active_time(video, keys, hues, cfg, fps, frame_count, width, keyboard_top)
+    write_debug_image(video, keys, hues, cfg, fps, width, keyboard_top, debug_path, debug_time, logger)
 
     logger.info("Tracking full video...")
     t0 = time.time()
     notes = track_video(
-        video, keys, left_hue, right_hue, cfg, fps, frame_count, width, keyboard_top, logger,
+        video, keys, hues, cfg, fps, frame_count, width, keyboard_top, logger,
         progress=not args.no_progress,
     )
     elapsed = time.time() - t0
@@ -1132,8 +1020,8 @@ def main(argv=None):
             "height": height,
             "scale": scale,
             "keyboard_top": keyboard_top,
-            "left_hue": left_hue,
-            "right_hue": right_hue,
+            "hues": hues,
+            "hand_split_midi": cfg.hand_split_midi,
             "calibration": cal_info,
             "note_count": len(notes),
         },

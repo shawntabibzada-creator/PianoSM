@@ -23,21 +23,34 @@ from tests.synthetic_video import render_video, scene_geometry
 FPS = 30.0
 QUARTER_SECONDS = 0.4  # 150 BPM; chosen so 8th/16th notes land on exact frames at 30fps.
 
+# A real tutorial video was found to use a third, distinctly different
+# note-bar color (30 = orange, far from the primary two) alongside the
+# usual two -- confirmed by the person testing this against actual
+# YouTube footage: colors there encode hand *and* white/black key type,
+# so more than two colors is a real, common case, not an edge case.
+# Calibration hardcoded to exactly two hues silently dropped that whole
+# voice. HUE_MAP below is what synthetic_video.py renders notes in;
+# "third" is used by one note to exercise that fix directly.
+HUE_MAP = {"left": 85, "right": 150, "third": 30}
+
 GROUND_TRUTH_SPEC = [
-    # (start_in_quarters, duration_in_quarters, midi, hand)
-    (0.0, 1.0, 60, "right"),   # C4  -- simultaneous with E4 below: a chord
-    (0.0, 1.0, 64, "right"),   # E4
-    (1.0, 0.5, 62, "right"),   # D4  eighth note
-    (1.5, 0.5, 65, "right"),   # F4  eighth note
-    (2.0, 4.0, 48, "left"),    # C3  whole note in the left hand, crosses the
-                               #     measure boundary at quarter=4 (tie test)
-    (2.0, 1.0, 67, "right"),   # G4  simultaneous with the sustained left note
-    (3.0, 1.0, 69, "right"),   # A4
-    (6.0, 0.25, 60, "right"),  # a run of 16th notes
-    (6.25, 0.25, 62, "right"),
-    (6.5, 0.25, 64, "right"),
-    (6.75, 0.25, 65, "right"),
-    (7.0, 1.0, 67, "right"),
+    # (start_in_quarters, duration_in_quarters, midi, hand, color)
+    (0.0, 1.0, 60, "right", None),   # C4  -- simultaneous with E4 below: a chord
+    (0.0, 1.0, 64, "right", None),   # E4
+    (1.0, 0.5, 62, "right", None),   # D4  eighth note
+    (1.5, 0.5, 65, "right", None),   # F4  eighth note
+    (2.0, 4.0, 48, "left", None),    # C3  whole note in the left hand, crosses the
+                                      #     measure boundary at quarter=4 (tie test)
+    (2.0, 1.0, 67, "right", None),   # G4  simultaneous with the sustained left note
+    (3.0, 1.0, 69, "right", None),   # A4
+    (6.0, 0.25, 60, "right", None),  # a run of 16th notes
+    (6.25, 0.25, 62, "right", None),
+    (6.5, 0.25, 64, "right", None),
+    (6.75, 0.25, 65, "right", None),
+    (7.0, 1.0, 67, "right", None),
+    (0.0, 1.0, 72, "right", "third"),  # C5 -- rendered in the third color;
+                                        # hand is still decided by pitch (>=60),
+                                        # not by which color it was drawn in.
 ]
 
 
@@ -51,10 +64,13 @@ def make_logger():
 
 def build_ground_truth():
     notes = []
-    for start_q, dur_q, midi, hand in GROUND_TRUTH_SPEC:
+    for start_q, dur_q, midi, hand, color in GROUND_TRUTH_SPEC:
         start = start_q * QUARTER_SECONDS
         end = (start_q + dur_q) * QUARTER_SECONDS
-        notes.append({"midi": midi, "start": start, "end": end, "hand": hand})
+        note = {"midi": midi, "start": start, "end": end, "hand": hand}
+        if color is not None:
+            note["color"] = color
+        notes.append(note)
     return notes
 
 
@@ -81,7 +97,7 @@ def calibrated_keymap(tmp_path_factory, ground_truth, logger):
     keys = calibrate_keymap.build_keymap(left_edge, right_edge)
 
     duration_s = max(n["end"] for n in ground_truth) + 1.0
-    render_video(video_path, width, height, FPS, duration_s, ground_truth, keys)
+    render_video(video_path, width, height, FPS, duration_s, ground_truth, keys, hue_map=HUE_MAP)
 
     keymap_path = tmp / "keyboard_map.json"
     debug_path = tmp / "keymap_debug.png"
@@ -128,7 +144,7 @@ def detection_video(tmp_path_factory, ground_truth, calibrated_keymap):
     keys = calibrate_keymap.build_keymap(left_edge, right_edge)
 
     duration_s = max(n["end"] for n in ground_truth) + 1.0
-    render_video(video_path, width, height, FPS, duration_s, ground_truth, keys)
+    render_video(video_path, width, height, FPS, duration_s, ground_truth, keys, hue_map=HUE_MAP)
 
     return {"path": video_path, "width": width, "height": height}
 
@@ -174,10 +190,12 @@ def test_detection_with_correct_scale_recovers_ground_truth(detection_video, cal
     assert scale == pytest.approx(2.0)
 
     cfg = keyboard_detector.DetectorConfig(scale=scale)
-    left_hue, right_hue, cal_info = keyboard_detector.learn_bright_hues(video, fps, frame_count, keyboard_top, cfg, logger)
+    hues, cal_info = keyboard_detector.learn_bright_hues(video, fps, frame_count, keyboard_top, cfg, logger)
+
+    assert len(hues) >= 3, f"Expected calibration to find all 3 distinct colors, got {hues}"
 
     detected = keyboard_detector.track_video(
-        video, keys, left_hue, right_hue, cfg, fps, frame_count, width, keyboard_top, logger, progress=False,
+        video, keys, hues, cfg, fps, frame_count, width, keyboard_top, logger, progress=False,
     )
     video.release()
 
@@ -213,10 +231,10 @@ def test_detection_without_scale_fix_fails(detection_video, calibrated_keymap, g
     cfg = keyboard_detector.DetectorConfig(scale=1.0)
     broken_keyboard_top = reference_keyboard_top
 
-    left_hue, right_hue, _ = keyboard_detector.learn_bright_hues(video, fps, frame_count, broken_keyboard_top, cfg, logger)
+    hues, _ = keyboard_detector.learn_bright_hues(video, fps, frame_count, broken_keyboard_top, cfg, logger)
 
     detected = keyboard_detector.track_video(
-        video, keys, left_hue, right_hue, cfg, fps, frame_count, width, broken_keyboard_top, logger, progress=False,
+        video, keys, hues, cfg, fps, frame_count, width, broken_keyboard_top, logger, progress=False,
     )
     video.release()
 
@@ -240,9 +258,9 @@ def detected_notes_json(tmp_path_factory, detection_video, calibrated_keymap, lo
     keyboard_top = int(round(reference_keyboard_top * scale))
     cfg = keyboard_detector.DetectorConfig(scale=scale)
 
-    left_hue, right_hue, cal_info = keyboard_detector.learn_bright_hues(video, fps, frame_count, keyboard_top, cfg, logger)
+    hues, cal_info = keyboard_detector.learn_bright_hues(video, fps, frame_count, keyboard_top, cfg, logger)
     notes = keyboard_detector.track_video(
-        video, keys, left_hue, right_hue, cfg, fps, frame_count, width, keyboard_top, logger, progress=False,
+        video, keys, hues, cfg, fps, frame_count, width, keyboard_top, logger, progress=False,
     )
     video.release()
 
@@ -370,8 +388,7 @@ def test_isolated_artifact_far_from_keyboard_is_not_active():
     half_width = cfg.key_half_width
 
     general = np.zeros((keyboard_top, width), dtype=bool)
-    right_bright = np.zeros((keyboard_top, width), dtype=bool)
-    left_bright = np.zeros((keyboard_top, width), dtype=bool)
+    bright = np.zeros((keyboard_top, width), dtype=bool)
 
     x1, x2 = 100 - half_width, 100 + half_width + 1
 
@@ -379,9 +396,9 @@ def test_isolated_artifact_far_from_keyboard_is_not_active():
     # keyboard at row 199 -- tall enough and bright enough to pass every
     # per-run check on its own.
     general[0:15, x1:x2] = True
-    right_bright[0:15, x1:x2] = True
+    bright[0:15, x1:x2] = True
 
-    result = keyboard_detector.analyze_key(general, left_bright, right_bright, key, cfg, width, keyboard_top, half_width)
+    result = keyboard_detector.analyze_key(general, bright, key, cfg, width, keyboard_top, half_width)
 
     assert result is not None
     assert result["active"] is False, "An artifact far from the keyboard must not be reported as a played note"
@@ -389,17 +406,15 @@ def test_isolated_artifact_far_from_keyboard_is_not_active():
     # Sanity check the fix doesn't also break real detections: the same
     # kind of bar, but actually touching the keyboard at the bottom row.
     general2 = np.zeros((keyboard_top, width), dtype=bool)
-    right_bright2 = np.zeros((keyboard_top, width), dtype=bool)
-    left_bright2 = np.zeros((keyboard_top, width), dtype=bool)
+    bright2 = np.zeros((keyboard_top, width), dtype=bool)
 
     general2[keyboard_top - 15 : keyboard_top, x1:x2] = True
-    right_bright2[keyboard_top - 15 : keyboard_top, x1:x2] = True
+    bright2[keyboard_top - 15 : keyboard_top, x1:x2] = True
 
-    result2 = keyboard_detector.analyze_key(general2, left_bright2, right_bright2, key, cfg, width, keyboard_top, half_width)
+    result2 = keyboard_detector.analyze_key(general2, bright2, key, cfg, width, keyboard_top, half_width)
 
     assert result2 is not None
     assert result2["active"] is True
-    assert result2["hand"] == "right"
 
 
 def test_sustain_uses_touching_not_brightness():
@@ -412,46 +427,38 @@ def test_sustain_uses_touching_not_brightness():
     every frame chopped one long note into dozens of near-zero-length
     fragments. Continuing an already-active note must only require the
     bar to still be touching the keyboard, regardless of brightness;
-    starting a brand new note still requires the full onset brightness
-    (needed to tell which hand's color it is)."""
+    starting a brand new note still requires the full onset brightness."""
 
     cfg = keyboard_detector.DetectorConfig(scale=1.0)
 
     bright_onset = {
+        "active": True,
         "touches_keyboard": True,
-        "left_ratio": 0.9, "right_ratio": 0.0,
-        "left_reaches_bottom": True, "right_reaches_bottom": False,
-        "left_rows": 10, "right_rows": 0,
+        "ratio": 0.9, "reaches_bottom": True, "rows": 10,
     }
     # Still touching the keyboard, but completely dark -- the "in between
     # pulses" state observed on real footage.
     dark_but_touching = {
+        "active": False,
         "touches_keyboard": True,
-        "left_ratio": 0.0, "right_ratio": 0.0,
-        "left_reaches_bottom": False, "right_reaches_bottom": False,
-        "left_rows": 0, "right_rows": 0,
+        "ratio": 0.0, "reaches_bottom": False, "rows": 0,
     }
     no_longer_touching = {
+        "active": False,
         "touches_keyboard": False,
-        "left_ratio": 0.0, "right_ratio": 0.0,
-        "left_reaches_bottom": False, "right_reaches_bottom": False,
-        "left_rows": 0, "right_rows": 0,
+        "ratio": 0.0, "reaches_bottom": False, "rows": 0,
     }
 
-    is_active, hand = keyboard_detector.decide_active_hand(bright_onset, None, cfg)
-    assert is_active and hand == "left"
+    assert keyboard_detector.decide_active(bright_onset, False, cfg) is True
 
-    # Continuing an already-active left-hand note through a completely
-    # dark (but still touching) frame must survive.
-    is_active, hand = keyboard_detector.decide_active_hand(dark_but_touching, "left", cfg)
-    assert is_active and hand == "left"
+    # Continuing an already-active note through a completely dark (but
+    # still touching) frame must survive.
+    assert keyboard_detector.decide_active(dark_but_touching, True, cfg) is True
 
     # The same dark frame must NOT be enough to start a brand new note
     # from scratch.
-    is_active, hand = keyboard_detector.decide_active_hand(dark_but_touching, None, cfg)
-    assert not is_active
+    assert keyboard_detector.decide_active(dark_but_touching, False, cfg) is False
 
     # Once the bar genuinely stops touching the keyboard, the note ends
     # even if it was previously active.
-    is_active, hand = keyboard_detector.decide_active_hand(no_longer_touching, "left", cfg)
-    assert not is_active
+    assert keyboard_detector.decide_active(no_longer_touching, True, cfg) is False
