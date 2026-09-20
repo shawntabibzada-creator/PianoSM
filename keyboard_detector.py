@@ -372,12 +372,24 @@ def learn_bright_hues(
     clamp_hue_tolerance_for_separation(cfg, color_a, color_b, logger)
     _adapt_bright_thresholds(video, scanned_indices, keyboard_top, color_a, color_b, cfg, logger)
 
-    # Determine left/right by x location, reusing the same scanned frames
-    # (not a separate re-scan of an arbitrary fixed window).
+    # Determine left/right by x location of *currently played* (bright)
+    # pixels. This needs its own scan, separate from the hue-histogram
+    # frames above: those stop as soon as they've seen enough general
+    # bar-color pixels (which are almost always present, since falling
+    # notes are on screen continuously), but a currently-played moment is
+    # much rarer, so that small, early batch of frames can easily contain
+    # zero of them — especially now that the bright threshold is the
+    # tighter, adapted one. Keep scanning across the full window until
+    # enough played-pixel samples are found for both colors.
     x_sums = [0.0, 0.0]
     x_counts = [0, 0]
+    min_x_samples = 150
+    x_step = max(1, int(round(fps / 10)))
 
-    for fi in scanned_indices[: max(1, min(len(scanned_indices), 12))]:
+    for fi in range(0, max_frame + 1, x_step):
+        if min(x_counts) >= min_x_samples:
+            break
+
         video.set(cv2.CAP_PROP_POS_FRAMES, fi)
         ok, frame = video.read()
 
@@ -411,9 +423,16 @@ def learn_bright_hues(
         else:
             left_hue, right_hue = color_b, color_a
     else:
-        left_hue, right_hue = FALLBACK_LEFT_HUE, FALLBACK_RIGHT_HUE
-        used_fallback = True
-        logger.warning("Could not determine left/right hand by x-position; using fallback hues")
+        # Still use the hues actually found in THIS video, not the
+        # unrelated fallback constants (tuned on a different reference
+        # video entirely) — being unsure which hand is which is a much
+        # smaller problem than detecting against the wrong colors.
+        left_hue, right_hue = color_a, color_b
+        logger.warning(
+            "Could not determine which color is which hand by x-position "
+            f"(counts={x_counts}); defaulting to left={left_hue:.1f} right={right_hue:.1f} "
+            "-- hands may be swapped, check the debug image."
+        )
 
     info = {
         "left_hue": left_hue,
